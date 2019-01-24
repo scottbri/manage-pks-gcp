@@ -2,8 +2,49 @@
 
 set -e
 
+#Usage function
+function usage {
+	echo ""
+	echo "Usage: $0 {provision|access|cleanup|destroy} <cluster-name> [plan-name]"
+	echo ""
+	echo "where:"
+	echo "     provision:     create a new pks cluster with load balancer"
+	echo "     access:        create a load balancer for an existing pks cluster"
+	echo "     cleanup:       delete the load balancers for a cluster"
+	echo "     destroy:       executes cleanup and interactive pks delete-cluster"
+	echo "     cluster-name:  the new k8s cluster to be provisioned"
+	echo "     plan-name:     the plan to use creating the cluster"
+	echo ""
+	echo "Notes on setup prior to usage:"
+	echo "Start by configuring PKS API access"
+	echo "  $ pks login -a PKS-API --client-name CLIENT-NAME --client-secret CLIENT-SECRET -k"
+	echo "Configure GCP SDK client, log in to GCP"
+	echo "  $ gcloud auth login"
+	echo "Configure GCP compute region, same as AZ configuration for PKS tile"
+	echo "  $ gcloud config set compute/region GCP_REGION"
+	echo ""
+	echo ""
+}
+
+if [ $# -lt 2 ] ; then
+    usage
+    exit 1
+fi
+
+# GLOBALS
+OPERATION=$1
+CLUSTER_NAME=$2
+CLUSTER_PLAN=$3
+CLUSTER_REGION=$(gcloud config list --format="value(compute.region)")
+CLUSTER_STATUS=""
+
+if [[ "$CLUSTER_REGION" == "" ]]; then
+  echo "ERROR: Configure GCP region, check step 3 on Instructions!!" >&2
+  exit 1
+fi
+
 if ! [ -x "$(command -v jq)" ]; then
-  echo 'Error: jq is not installed.' >&2
+  echo 'ERROR: jq is not installed.' >&2
   exit 1
 fi
 
@@ -12,26 +53,15 @@ if ! [ -f "${HOME}/.pks/creds.yml" ]; then
   exit 1
 fi
 
-CLUSTER_REGION=$(gcloud config list --format="value(compute.region)")
-if [[ "$CLUSTER_REGION" == "" ]]; then
-  echo "Error: Configure GCP region, check step 3 on Instructions!!" >&2
-  exit 1
-fi
+
 
 #Function to reserve IP on GCP & create cluster
 function provision_cluster {
-  echo -e "\nEnter pks cluster name to be created and press [ENTER]: "
-  read CLUSTER_NAME
-
-  echo -e "\nListing pks plans..."
-  pks list-plans
-
-  echo -e "\nEnter pks plan to be provisioned, choose plan from above list and press [ENTER]: "
-  read CLUSTER_PLAN
 
   LB_NAME="$CLUSTER_NAME-lb"
+  # uses global variables
 
-  echo -n "Reserving public IP for cluster loadbalancer"
+  echo -n "Reserving public IP for cluster load balancer"
   gcloud compute addresses create $LB_NAME --region=$CLUSTER_REGION
   CLUSTER_IP=$(gcloud compute addresses describe $LB_NAME --region=$CLUSTER_REGION --format="value(address)")
 
@@ -41,15 +71,10 @@ function provision_cluster {
 
 #Function to enable access to pks cluster on gcp
 function enable_access {
-  echo -e "Listing available clusters..."
-  pks clusters
-
-  echo -e "\nEnter pks cluster name from above list & press [ENTER]: "
-  read CLUSTER_NAME
 
   LB_NAME="$CLUSTER_NAME-lb"
   FORWARDING_RULE="pks-$CLUSTER_NAME-forwarding-rule"
-  CLUSTER_REGION=$(gcloud config list --format="value(compute.region)")
+  # uses global variables
 
   if ! [[ "$(gcloud compute target-pools list --filter="name=$LB_NAME" --format="value(name)")" == "" ]]; then
     echo -e "\nLoad balancer $LB_NAME already exists..."
@@ -119,15 +144,10 @@ function enable_access {
 }
 
 function gcp_cleanup {
-  echo -e "Listing available clusters..."
-  pks clusters
-
-  echo -e "\nEnter pks cluster name from above list & press [ENTER]: "
-  read CLUSTER_NAME
 
   LB_NAME="$CLUSTER_NAME-lb"
-  CLUSTER_REGION=$(gcloud config list --format="value(compute.region)")
   CLUSTER_UUID=$(pks cluster $CLUSTER_NAME --json | jq -r .uuid)
+  # uses global variables
 
   echo "Deleting firewall rule"
   gcloud compute firewall-rules delete $CLUSTER_NAME-fw-$CLUSTER_UUID --quiet
@@ -137,21 +157,65 @@ function gcp_cleanup {
 
   echo "Deleting target pool/lb"
   gcloud compute target-pools delete $LB_NAME --quiet
+
+  echo "Deleting $LB_NAME reserved IP addres"
+  gcloud compute addresses delete $LB_NAME
+
 }
 
-operation=$1
+function wait_for_it {
+  WAIT=10
+  MAXWAIT=1800  # 1800 seconds is 30 minutes
+  # uses global variables
 
-case $operation in
+  ORIG_CLUSTER_STATUS=$(pks cluster $CLUSTER_NAME --json  | jq  -r .last_action_state)
+  CLUSTER_STATUS="$ORIG_CLUSTER_STATUS"
+  echo "Cluster status is \"$CLUSTER_STATUS\" at `date`"
+  echo -n "Monitoring for status change..."
+  while [ "$CLUSTER_STATUS" = "$ORIG_CLUSTER_STATUS" ]
+  do
+      sleep $WAIT
+      echo -n "."
+
+      CLUSTER_STATUS=$(pks cluster $CLUSTER_NAME --json  | jq  -r .last_action_state)
+      MAXWAIT=$((MAXWAIT-$WAIT))
+      if [ "$MAXWAIT" = "0" ]; then
+        echo ""; echo "ERROR: Status has not changed.  Make sure it's working."
+        exit 1 
+      fi
+  done
+  echo "Cluster status changed to \"$CLUSTER_STATUS\" at `date`"
+}
+
+# already set $OPERATION = $1 above
+case $OPERATION in
   provision)
     provision_cluster
+    wait_for_it
+    if [ "$CLUSTER_STATUS" = "succeeded" ]
+    then
+	enable_access
+    else
+	echo "ERROR:  Cluster $CLUSTER_NAME is reporting status $CLUSTER_STATUS.  Aborting."
+    fi
     ;;
   access)
-    enable_access
+    wait_for_it
+    if [ "$CLUSTER_STATUS" = "succeeded" ]
+    then
+	enable_access
+    else
+	echo "ERROR:  Cluster $CLUSTER_NAME is reporting status $CLUSTER_STATUS.  Aborting."
+    fi
     ;;
   cleanup)
     gcp_cleanup
     ;;
+  destroy)
+    gcp_cleanup
+    pks delete-cluster $CLUSTER_NAME
+    ;;
   *)
-    echo $"Usage: $0 {provision|access|cleanup}"
+    usage
     exit 1
 esac
